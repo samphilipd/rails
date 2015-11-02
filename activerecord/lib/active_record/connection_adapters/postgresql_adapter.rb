@@ -581,6 +581,11 @@ module ActiveRecord
           log(sql, name, binds) { @connection.async_exec(sql, type_casted_binds) }
         end
 
+        # Create a new error class because the default is FEATURE_NOT_SUPPORTED
+        # which is too general
+        PG::PreparedStatementCacheExpired = Class.new(PG::FeatureNotSupported)
+        CACHED_PLAN_HEURISTIC = 'cached plan must not change result type'.freeze
+
         def exec_cache(sql, name, binds)
           stmt_key = prepare_statement(sql)
           type_casted_binds = binds.map { |attr| type_cast(attr.value_for_database) }
@@ -595,17 +600,33 @@ module ActiveRecord
           # prepared statements whose return value may have changed is
           # FEATURE_NOT_SUPPORTED.  Check here for more details:
           # http://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/backend/utils/cache/plancache.c#l573
+
+          # TODO: why would this fail?
           begin
             code = pgerror.result.result_error_field(PGresult::PG_DIAG_SQLSTATE)
           rescue
             raise e
           end
-          if FEATURE_NOT_SUPPORTED == code
-            @statements.delete sql_key(sql)
-            retry
+          if FEATURE_NOT_SUPPORTED == code && pgerror.message.include?(CACHED_PLAN_HEURISTIC)
+            if in_transaction?
+              # if we fail inside a transaction we must flush the entire cache
+              # and retry from the beginning of the transaction block
+              # We cannot flush the cache from within a failed transaction, so
+              # we have to propagate up to the transaction block and do it there
+              # instead
+              raise PG::PreparedStatementCacheExpired.new(pgerror.message)
+            else
+              # outside of transactions we can simply flush this query and retry
+              @statements.delete sql_key(sql)
+              retry
+            end
           else
             raise e
           end
+        end
+
+        def in_transaction?
+          open_transactions > 0
         end
 
         # Returns the statement identifier for the client side cache

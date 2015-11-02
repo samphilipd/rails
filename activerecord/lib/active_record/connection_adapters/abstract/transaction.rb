@@ -181,6 +181,11 @@ module ActiveRecord
       def within_new_transaction(options = {})
         transaction = begin_transaction options
         yield
+      rescue PG::PreparedStatementCacheExpired => e
+        raise unless transaction.is_a?(RealTransaction)
+        rollback_transaction
+        @connection.clear_cache!
+        retry
       rescue Exception => error
         rollback_transaction if transaction
         raise
@@ -208,7 +213,9 @@ module ActiveRecord
       end
 
       private
-        NULL_TRANSACTION = NullTransaction.new
+
+      NULL_TRANSACTION = NullTransaction.new
+
     end
   end
 end
