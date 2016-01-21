@@ -393,14 +393,16 @@ module ActiveRecord
 
               saved = true
 
-              if autosave != false && (@new_record_before_save || record.new_record?)
-                if autosave
-                  saved = association.insert_record(record, false)
-                else
-                  association.insert_record(record) unless reflection.nested?
+              with_disabled_autosave_on_inverses(reflection.active_record) do
+                if autosave != false && (@new_record_before_save || record.new_record?)
+                  if autosave
+                    saved = association.insert_record(record, false)
+                  else
+                    association.insert_record(record) unless reflection.nested?
+                  end
+                elsif autosave
+                  saved = record.save(:validate => false)
                 end
-              elsif autosave
-                saved = record.save(:validate => false)
               end
 
               raise ActiveRecord::Rollback unless saved
@@ -409,6 +411,32 @@ module ActiveRecord
 
           # reconstruct the scope now that we know the owner's id
           association.reset_scope if association.respond_to?(:reset_scope)
+        end
+      end
+
+      # In the case where both ends of the relation have autosave: true, we can
+      # end up in a scenario where the save on the parent triggers a save on the
+      # child, triggering a second, duplicate save on the parent again.
+      #
+      # In order to avoid this we temporarily disable autosave on associations
+      # leading back from child records to this parent.
+      def with_disabled_autosave_on_inverses(klass)
+        inverse_reflections_with_autosave = Set.new
+
+        klass.reflections.values.each do |reflection|
+          next if reflection.polymorphic? || reflection.inverse_of.try(:options).try(:[], :autosave) != true
+          inverse_reflections_with_autosave << reflection.inverse_of
+        end
+
+        inverse_reflections_with_autosave.each do |inverse_reflection|
+          inverse_reflection.options[:autosave] = false
+        end
+
+        return yield
+
+      ensure
+        inverse_reflections_with_autosave.each do |inverse_reflection|
+          inverse_reflection.options[:autosave] = true
         end
       end
 
@@ -437,7 +465,10 @@ module ActiveRecord
                 record[reflection.foreign_key] = key
               end
 
-              saved = record.save(:validate => !autosave)
+              saved = with_disabled_autosave_on_inverses(reflection.active_record) do
+                record.save(:validate => !autosave)
+              end
+
               raise ActiveRecord::Rollback if !saved && autosave
               saved
             end
@@ -465,7 +496,11 @@ module ActiveRecord
             self[reflection.foreign_key] = nil
             record.destroy
           elsif autosave != false
-            saved = record.save(:validate => !autosave) if record.new_record? || (autosave && record.changed_for_autosave?)
+            if record.new_record? || (autosave && record.changed_for_autosave?)
+              saved = with_disabled_autosave_on_inverses(reflection.active_record) do
+                record.save(:validate => !autosave)
+              end
+            end
 
             if association.updated?
               association_id = record.send(reflection.options[:primary_key] || :id)
